@@ -1,0 +1,44 @@
+{
+  "outputRoot": "${HOME}/ai-outputs/04-技能驗證/x-article-reader",
+  "keepRuns": 10,
+  "cases": [
+    {
+      "label": "geoff-status-full",
+      "args": [
+        "https://x.com/geoffintech/status/2042002590758572377",
+        "--json"
+      ],
+      "expect": {
+        "articleTitle": "How to get your company AI pilled",
+        "bodyMinChars": 8000,
+        "extractionMethod": "status_page_visible_text"
+      }
+    },
+    {
+      "label": "geoff-status-preview-fallback",
+      "args": [
+        "https://x.com/geoffintech/status/2042002590758572377",
+        "--json",
+        "--no-browser"
+      ],
+      "expect": {
+        "articleTitle": "How to get your company AI pilled",
+        "previewMinChars": 80,
+        "bodyAbsent": true,
+        "warningContains": "摘要"
+      }
+    },
+    {
+      "label": "rohit-direct-article",
+      "args": [
+        "https://x.com/rohit4verse/article/2041548810804211936",
+        "--json"
+      ],
+      "expect": {
+        "articleTitle": "How I built harness for my agent using Claude Code leaks",
+        "bodyMinChars": 10000,
+        "extractionMethod": "playwright_article_page_visible_text"
+      }
+    }
+  ]
+}
