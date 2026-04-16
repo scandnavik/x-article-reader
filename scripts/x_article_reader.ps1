@@ -14,6 +14,9 @@ if ($env:XARTICLE_READER_PYTHON) {
 }
 
 $scriptPath = Join-Path $PSScriptRoot "x_article_reader.py"
-& $python $scriptPath @Args
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new()
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+& $python -X utf8 $scriptPath @Args
 exit $LASTEXITCODE
-

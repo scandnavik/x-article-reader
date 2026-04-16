@@ -1,6 +1,6 @@
 ---
 name: "x-article-reader"
-description: "Use when the user shares an X status or X article URL and wants the article text, a clean Markdown export, or a low-token way to read or summarize a public X Article. This is especially important when a status is only a wrapper around a long article."
+description: "Use when the user shares an X status or X article URL and wants the article text, a clean Markdown export, or a low-token way to read or summarize a public X Article. Also supports --thread mode to capture the author's full self-reply chain under a status. This is especially important when a status is only a wrapper around a long article."
 ---
 
 # X Article Reader
@@ -8,9 +8,10 @@ description: "Use when the user shares an X status or X article URL and wants th
 Use this skill when the user gives you:
 - an `x.com/.../status/...` link that is really pointing at an X Article
 - an `x.com/<handle>/article/<id>` link
+- a status URL where the author has a self-reply thread underneath (use `--thread`)
 - a request to read, export, or summarize a public X Article without relying on the official X API
 
-This skill is designed for public X content on this machine. It does not require an official X API key.
+This skill is designed for public X content on this machine. It does not require an official X API key. `--thread` mode requires a logged-in cookie jar (see below).
 
 ## What the bundled script does
 
@@ -53,6 +54,29 @@ powershell -ExecutionPolicy Bypass -File scripts/x_article_reader.ps1 "<status-u
 1. If the input is a status URL, prefer the status-page extraction path.
 2. If browser extraction fails, keep the article title and preview from the public metadata endpoint.
 3. If the user only provided an `x.com/i/article/...` link and extraction fails, report that the link is not directly supported and ask for the original status URL when possible.
+
+## Thread mode (`--thread`)
+
+Captures the original tweet plus every self-reply from the same author under the same status, with long-tweet "Show more" auto-expanded.
+
+```bash
+python scripts/x_article_reader.py "<status-url>" --thread
+```
+
+Behavior:
+- Output Markdown is auto-saved to `~/ai-outputs/01-內容生產/00-靈感收集/x-captures/<handle>-<statusid>.md` when `--out` is not supplied.
+- Frontmatter includes `title`, `domain: x-captures`, `source`, `author`, `handle`, `posted_at`, `captured`, `tweet_count`.
+- Replies from other users are filtered out; only the original author's posts are kept.
+
+### Cookie jar setup (required once)
+
+X serves only the root tweet to anonymous visitors. To read self-replies the script injects cookies from an already-logged-in browser session.
+
+1. In your daily Chrome (where x.com is logged in), install a cookie export extension such as Cookie-Editor.
+2. Open `https://x.com`, click the extension, export cookies as JSON.
+3. Save the JSON to `~/.x-article-reader/cookies.json` (create the folder if missing).
+
+The file is read every run. Rotate when the session expires (symptom: `--thread` returns only the root tweet).
 
 ## Harness
 

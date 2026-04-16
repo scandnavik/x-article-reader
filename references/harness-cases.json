@@ -39,6 +39,21 @@
         "bodyMinChars": 10000,
         "extractionMethod": "playwright_article_page_visible_text"
       }
+    },
+    {
+      "label": "bcherny-self-reply-thread",
+      "args": [
+        "https://x.com/bcherny/status/2044847848035156457",
+        "--thread",
+        "--json"
+      ],
+      "expect": {
+        "threadAuthorHandle": "bcherny",
+        "threadMinTweets": 7,
+        "threadRootIncluded": true,
+        "threadAllTweetsHaveText": true,
+        "threadMinTotalChars": 3000
+      }
     }
   ]
 }

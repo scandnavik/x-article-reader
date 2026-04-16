@@ -145,6 +145,37 @@ def evaluate_case(case: dict[str, Any], completed: subprocess.CompletedProcess[s
         if warning_contains and not any(warning_contains in item for item in warnings):
             errors.append(f"找不到預期警告內容：{warning_contains}")
 
+        thread = parsed.get("thread") or {}
+        tweets = thread.get("tweets") or []
+
+        expected_handle = expect.get("threadAuthorHandle")
+        if expected_handle:
+            handles = {(t.get("handle") or "").lower() for t in tweets}
+            if handles and handles != {expected_handle.lower()}:
+                errors.append(
+                    f"thread 含有非作者貼文：{handles - {expected_handle.lower()}}"
+                )
+
+        min_tweets = expect.get("threadMinTweets")
+        if min_tweets is not None and len(tweets) < min_tweets:
+            errors.append(f"thread 貼文數太少：{len(tweets)} < {min_tweets}")
+
+        if expect.get("threadRootIncluded"):
+            root_id = thread.get("rootId")
+            if root_id and not any(t.get("statusId") == root_id for t in tweets):
+                errors.append("thread 沒有包含原推。")
+
+        if expect.get("threadAllTweetsHaveText"):
+            empty = [t.get("statusId") for t in tweets if not (t.get("text") or "").strip()]
+            if empty:
+                errors.append(f"thread 有空文字貼文：{empty}")
+
+        min_total = expect.get("threadMinTotalChars")
+        if min_total is not None:
+            total = sum(len(t.get("text") or "") for t in tweets)
+            if total < min_total:
+                errors.append(f"thread 文字量太少：{total} < {min_total}")
+
     return {
         "label": case["label"],
         "status": "pass" if not errors else "fail",

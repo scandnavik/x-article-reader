@@ -73,10 +73,15 @@ ARTICLE_END_MARKERS = [
 
 
 def main() -> int:
+    configure_stdio_utf8()
     args = parse_args()
     input_info = parse_input(args.input)
 
-    if input_info["kind"] == "status":
+    if args.thread:
+        if input_info["kind"] != "status":
+            fail("--thread 模式目前只支援 status URL 或 tweet ID。")
+        result = read_thread_input(input_info, args)
+    elif input_info["kind"] == "status":
         result = read_status_input(input_info, args)
     else:
         result = read_article_input(input_info, args)
@@ -87,13 +92,30 @@ def main() -> int:
         else render_markdown(result)
     )
 
-    if args.out:
-        out_path = Path(args.out).expanduser().resolve()
+    out_target = args.out
+    if not out_target and args.thread and result.get("thread"):
+        out_target = default_thread_out_path(result)
+
+    if out_target:
+        out_path = Path(out_target).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(f"{rendered}\n", encoding="utf-8")
         print(f"已輸出到 {out_path}", file=sys.stderr)
 
     sys.stdout.write(f"{rendered}\n")
     return 0
+
+
+def configure_stdio_utf8() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (LookupError, ValueError):
+            continue
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +136,17 @@ def parse_args() -> argparse.Namespace:
         "--disable-direct-article",
         action="store_true",
         help="Skip the direct article Playwright step",
+    )
+    parser.add_argument(
+        "--thread",
+        action="store_true",
+        help="Expand the conversation and keep only self-replies from the original author",
+    )
+    parser.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=25,
+        help="Max scroll rounds when expanding a thread (default: 25)",
     )
     return parser.parse_args()
 
@@ -366,6 +399,302 @@ def read_article_input(input_info: dict[str, Any], args: argparse.Namespace) -> 
             },
         },
     }
+
+
+COOKIES_PATH = Path.home() / ".x-article-reader" / "cookies.json"
+
+PLAYWRIGHT_THREAD_SHIM = r'''
+from playwright.sync_api import sync_playwright
+import json
+import sys
+import time
+from pathlib import Path
+
+url = sys.argv[1]
+cookies_path = Path(sys.argv[2])
+max_scrolls = int(sys.argv[3])
+
+SAME_SITE_MAP = {
+    "no_restriction": "None",
+    "none": "None",
+    "lax": "Lax",
+    "strict": "Strict",
+    "unspecified": None,
+}
+
+
+def normalize_cookies(raw):
+    out = []
+    for c in raw:
+        name = c.get("name")
+        value = c.get("value")
+        domain = c.get("domain")
+        if not name or value is None or not domain:
+            continue
+        item = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": c.get("path") or "/",
+            "httpOnly": bool(c.get("httpOnly")),
+            "secure": bool(c.get("secure")),
+        }
+        expires = c.get("expires")
+        if expires is None:
+            expires = c.get("expirationDate")
+        if isinstance(expires, (int, float)) and expires > 0:
+            item["expires"] = float(expires)
+        same_site = c.get("sameSite")
+        if isinstance(same_site, str):
+            mapped = SAME_SITE_MAP.get(same_site.lower(), same_site)
+            if mapped in {"None", "Lax", "Strict"}:
+                item["sameSite"] = mapped
+        out.append(item)
+    return out
+
+
+EXTRACT_JS = """
+() => {
+  const nodes = Array.from(document.querySelectorAll('article[data-testid=\"tweet\"]'));
+  const items = nodes.map((node) => {
+    const timeAnchor = node.querySelector('a[href*=\"/status/\"] time');
+    const href = timeAnchor ? timeAnchor.parentElement.getAttribute('href') : null;
+    const datetime = timeAnchor ? timeAnchor.getAttribute('datetime') : null;
+    const m = href ? href.match(/^\\/([^/]+)\\/status\\/(\\d+)/) : null;
+    const textNode = node.querySelector('[data-testid=\"tweetText\"]');
+    const text = textNode ? textNode.innerText : '';
+    let photoCount = 0;
+    try { photoCount = node.querySelectorAll('[data-testid=\"tweetPhoto\"]').length; } catch (e) {}
+    return {
+      handle: m ? m[1] : null,
+      statusId: m ? m[2] : null,
+      datetime: datetime,
+      text: text,
+      hasPhoto: photoCount > 0
+    };
+  }).filter((i) => i.handle && i.statusId && i.text);
+  const seen = new Set();
+  const unique = [];
+  for (const it of items) {
+    if (seen.has(it.statusId)) continue;
+    seen.add(it.statusId);
+    unique.push(it);
+  }
+  return unique;
+}
+"""
+
+raw_cookies = []
+if cookies_path.exists():
+    try:
+        raw = json.loads(cookies_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and "cookies" in raw:
+            raw = raw["cookies"]
+        if isinstance(raw, list):
+            raw_cookies = normalize_cookies(raw)
+    except Exception as exc:
+        print(json.dumps({"error": f"cookie load failed: {exc}"}), flush=True)
+        sys.exit(2)
+
+collected = {}
+warnings = []
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(
+        viewport={"width": 1440, "height": 2400},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+    )
+    if raw_cookies:
+        try:
+            context.add_cookies(raw_cookies)
+        except Exception as exc:
+            warnings.append(f"add_cookies failed: {exc}")
+    page = context.new_page()
+    page.goto(url, wait_until="domcontentloaded", timeout=120000)
+    page.wait_for_timeout(4500)
+
+    last_height = 0
+    stable = 0
+    expand_js = """
+    () => {
+      const links = Array.from(document.querySelectorAll('[data-testid=\"tweet-text-show-more-link\"]'));
+      let clicked = 0;
+      for (const link of links) {
+        try { link.click(); clicked += 1; } catch (e) {}
+      }
+      return clicked;
+    }
+    """
+    for _ in range(max_scrolls):
+        try:
+            page.evaluate(expand_js)
+            page.wait_for_timeout(600)
+        except Exception as exc:
+            warnings.append(f"expand failed: {exc}")
+        try:
+            batch = page.evaluate(EXTRACT_JS)
+        except Exception as exc:
+            warnings.append(f"evaluate failed: {exc}")
+            batch = []
+        for item in batch or []:
+            sid = item.get("statusId")
+            if sid and sid not in collected:
+                collected[sid] = item
+        height = page.evaluate("document.body.scrollHeight") or 0
+        if height == last_height:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable = 0
+        last_height = height
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1800)
+
+    browser.close()
+
+print(json.dumps({
+    "tweets": list(collected.values()),
+    "warnings": warnings,
+    "cookiesLoaded": len(raw_cookies),
+}, ensure_ascii=False))
+'''.strip()
+
+
+def read_thread_input(input_info: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    tweet_id = input_info["tweetId"]
+    syndication = fetch_tweet_result(tweet_id)
+    canonical_status_url = build_status_url(tweet_id, syndication)
+    user = syndication.get("user", {})
+    author_handle = user.get("screen_name")
+    if not author_handle:
+        fail("無法從公開資料判定原推作者 handle。")
+
+    warnings: list[str] = []
+    tweets: list[dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
+
+    if args.no_browser:
+        fail("--thread 需要瀏覽器擷取，無法與 --no-browser 同用。")
+
+    if not COOKIES_PATH.exists():
+        warnings.append(
+            f"沒找到 {COOKIES_PATH}；X 對匿名用戶只顯示原推，self-reply 會抓不到。"
+            " 請用 Cookie-Editor 等擴充套件從已登入的 Chrome 匯出 x.com cookies 到上述路徑。"
+        )
+
+    try:
+        thread_payload = expand_thread_with_playwright(
+            canonical_status_url,
+            max_scrolls=args.max_scrolls,
+        )
+        tweets = thread_payload.get("tweets") or []
+        cookies_loaded = thread_payload.get("cookiesLoaded") or 0
+        for warning in thread_payload.get("warnings") or []:
+            warnings.append(warning)
+        attempts.append(
+            {
+                "name": "playwright_thread_scroll",
+                "success": bool(tweets),
+                "count": len(tweets),
+                "cookiesLoaded": cookies_loaded,
+                "url": canonical_status_url,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        attempts.append(
+            {
+                "name": "playwright_thread_scroll",
+                "success": False,
+                "url": canonical_status_url,
+                "error": str(exc),
+            }
+        )
+        warnings.append(f"展開對話失敗：{exc}")
+
+    author_lower = author_handle.lower()
+    self_tweets = [t for t in tweets if (t.get("handle") or "").lower() == author_lower]
+
+    if not self_tweets:
+        warnings.append("沒有抓到原作者的貼文節點，可能需要登入 session 或頁面尚未完全載入。")
+
+    ordered = order_thread_tweets(self_tweets, root_id=tweet_id)
+
+    return {
+        "source": "x.com",
+        "input": input_info.get("rawInput", tweet_id),
+        "tweetId": tweet_id,
+        "statusUrl": canonical_status_url,
+        "articleUrl": None,
+        "author": {
+            "name": user.get("name"),
+            "handle": author_handle,
+        },
+        "createdAt": syndication.get("created_at"),
+        "lang": syndication.get("lang"),
+        "stats": {
+            "favorites": syndication.get("favorite_count"),
+            "replies": syndication.get("conversation_count"),
+        },
+        "tweetText": expand_tweet_urls(
+            syndication.get("text", ""),
+            syndication.get("entities", {}).get("urls", []),
+        ),
+        "warnings": warnings,
+        "thread": {
+            "rootId": tweet_id,
+            "count": len(ordered),
+            "totalCapturedInPage": len(tweets),
+            "tweets": ordered,
+            "extraction": {
+                "method": "thread_scroll_expand",
+                "success": bool(ordered),
+                "attempts": attempts,
+            },
+        },
+    }
+
+
+def expand_thread_with_playwright(url: str, *, max_scrolls: int) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "-c",
+            PLAYWRIGHT_THREAD_SHIM,
+            url,
+            str(COOKIES_PATH),
+            str(max_scrolls),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+    )
+    if completed.returncode != 0:
+        message = (completed.stdout + completed.stderr).strip() or f"playwright thread exit {completed.returncode}"
+        raise RuntimeError(message)
+    try:
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as exc:
+        raise RuntimeError(f"無法解析 thread 輸出：{exc}\n{completed.stdout[:500]}") from exc
+
+
+def order_thread_tweets(tweets: list[dict[str, Any]], *, root_id: str) -> list[dict[str, Any]]:
+    def sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
+        is_root = 0 if item.get("statusId") == root_id else 1
+        datetime_value = item.get("datetime") or ""
+        status_id = item.get("statusId") or ""
+        return (is_root, datetime_value, status_id)
+
+    return sorted(tweets, key=sort_key)
 
 
 def fetch_tweet_result(tweet_id: str) -> dict[str, Any]:
@@ -635,6 +964,8 @@ def is_direct_article_meta_line(line: str) -> bool:
 
 
 def render_markdown(result: dict[str, Any]) -> str:
+    if result.get("thread"):
+        return render_thread_markdown(result)
     lines = []
     article = result.get("article") or {}
     title = article.get("title")
@@ -661,6 +992,97 @@ def render_markdown(result: dict[str, Any]) -> str:
         lines.append(content)
     else:
         lines.extend(["", "## 內文", result.get("tweetText") or "(無文字內容)"])
+
+    warnings = result.get("warnings") or []
+    if warnings:
+        lines.append("")
+        lines.append("## 備註")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+
+    return "\n".join(lines)
+
+
+def default_thread_out_path(result: dict[str, Any]) -> str:
+    author = result.get("author") or {}
+    handle = (author.get("handle") or "unknown").lower()
+    tweet_id = result.get("tweetId") or "unknown"
+    return str(
+        Path.home()
+        / "ai-outputs"
+        / "01-內容生產"
+        / "00-靈感收集"
+        / "x-captures"
+        / f"{handle}-{tweet_id}.md"
+    )
+
+
+def render_thread_frontmatter(result: dict[str, Any]) -> list[str]:
+    author = result.get("author") or {}
+    handle = author.get("handle") or ""
+    name = author.get("name") or handle or "unknown"
+    thread = result.get("thread") or {}
+    tweets = thread.get("tweets") or []
+    first_text = (tweets[0].get("text") if tweets else "") or ""
+    title_snippet = first_text.strip().replace("\n", " ")[:60] or f"{name} thread"
+    title_snippet = title_snippet.replace('"', "'")
+    created = result.get("createdAt") or ""
+    today = time.strftime("%Y-%m-%d")
+    tags = ["x-thread", "x-capture"]
+    if handle:
+        tags.append(f"author-{handle.lower()}")
+
+    lines = ["---"]
+    lines.append(f'title: "{title_snippet}"')
+    lines.append("domain: x-captures")
+    lines.append("status: seed")
+    lines.append(f"tags: {json.dumps(tags, ensure_ascii=False)}")
+    lines.append(f'source: "{result.get("statusUrl") or result.get("input") or ""}"')
+    lines.append(f'author: "{name}"')
+    if handle:
+        lines.append(f'handle: "@{handle}"')
+    if created:
+        lines.append(f'posted_at: "{created}"')
+    lines.append(f"captured: {today}")
+    lines.append(f"tweet_count: {thread.get('count') or 0}")
+    lines.append("---")
+    lines.append("")
+    return lines
+
+
+def render_thread_markdown(result: dict[str, Any]) -> str:
+    lines: list[str] = render_thread_frontmatter(result)
+    author = result.get("author") or {}
+    author_label = render_author(author)
+    lines.append(f"# {author_label} 的 thread")
+    lines.append("")
+    lines.append("## 來源")
+    lines.append(f"- 作者：{author_label}")
+    lines.append(f"- 連結：{result.get('statusUrl') or result.get('input')}")
+    thread = result.get("thread") or {}
+    lines.append(f"- 作者本人貼文數：{thread.get('count') or 0}")
+    lines.append(f"- 頁面總節點數：{thread.get('totalCapturedInPage') or 0}")
+    lines.append("")
+    tweets = thread.get("tweets") or []
+    for index, item in enumerate(tweets):
+        if index > 0:
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        marker = "原推" if item.get("statusId") == thread.get("rootId") else f"#{index + 1}"
+        datetime_value = item.get("datetime") or "?"
+        lines.append(f"### {marker}  ·  {datetime_value}")
+        status_id = item.get("statusId")
+        handle = item.get("handle")
+        if status_id and handle:
+            lines.append(f"https://x.com/{handle}/status/{status_id}")
+        body_text = item.get("text") or ""
+        if body_text:
+            lines.append("")
+            lines.append(body_text)
+        if item.get("hasPhoto"):
+            lines.append("")
+            lines.append("_(含圖片)_")
 
     warnings = result.get("warnings") or []
     if warnings:
