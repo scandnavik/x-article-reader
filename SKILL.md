@@ -65,7 +65,7 @@ python scripts/x_article_reader.py "<status-url>" --thread
 
 Behavior:
 - Output Markdown is auto-saved to `~/ai-outputs/01-內容生產/00-靈感收集/x-captures/<handle>-<statusid>.md` when `--out` is not supplied.
-- Frontmatter includes `title`, `domain: x-captures`, `source`, `author`, `handle`, `posted_at`, `captured`, `tweet_count`.
+- Frontmatter includes `title`, `domain: research` (fallback; user may reclassify to `ai-agent` / `claude-code` by topic), `source`, `author`, `handle`, `posted_at`, `captured`, `tweet_count`.
 - Replies from other users are filtered out; only the original author's posts are kept.
 
 ### Cookie jar setup (required once)

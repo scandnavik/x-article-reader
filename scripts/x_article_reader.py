@@ -1034,7 +1034,7 @@ def render_thread_frontmatter(result: dict[str, Any]) -> list[str]:
 
     lines = ["---"]
     lines.append(f'title: "{title_snippet}"')
-    lines.append("domain: x-captures")
+    lines.append("domain: research")
     lines.append("status: seed")
     lines.append(f"tags: {json.dumps(tags, ensure_ascii=False)}")
     lines.append(f'source: "{result.get("statusUrl") or result.get("input") or ""}"')
